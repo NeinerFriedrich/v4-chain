@@ -111,6 +111,9 @@ func CheckCollateralizationForSubaccounts(
 		return nil, err
 	}
 
+	// For the purposes of the health check, log the successful request as an indicator of daemon health.
+	daemon.ReportSuccess()
+
 	return response.Results, nil
 }
 
@@ -207,6 +210,9 @@ func GetAllSubaccounts(
 		if err != nil {
 			return nil, err
 		}
+
+		// For the purposes of the health check, log the successful request as an indicator of daemon health.
+		daemon.ReportSuccess()
 
 		subaccounts = append(subaccounts, subaccountsFromKey...)
 		nextKey = next

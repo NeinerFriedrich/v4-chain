@@ -109,8 +109,13 @@ func TestGetAllSubaccounts(t *testing.T) {
 			)
 			if err != nil {
 				require.EqualError(t, err, tc.expectedError.Error())
+				// The daemon initializes as unhealthy.
+				// If a request fails, the daemon will not be toggled to healthy.
+				require.Error(t, daemonClient.HealthCheck())
 			} else {
 				require.Equal(t, tc.expectedSubaccounts, actual)
+				// If the request(s) succeeded, expect a healthy daemon.
+				require.NoError(t, daemonClient.HealthCheck())
 			}
 		})
 	}
@@ -211,8 +216,13 @@ func TestCheckCollateralizationForSubaccounts(t *testing.T) {
 
 			if err != nil {
 				require.EqualError(t, err, tc.expectedError.Error())
+				// The daemon initializes as unhealthy.
+				// If a request fails, the daemon will not be toggled to healthy.
+				require.Error(t, daemon.HealthCheck())
 			} else {
 				require.Equal(t, tc.expectedResults, actual)
+				// If the request(s) succeeded, expect a healthy daemon.
+				require.NoError(t, daemon.HealthCheck())
 			}
 		})
 	}
