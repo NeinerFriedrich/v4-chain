@@ -14,9 +14,9 @@ var (
 	zeroDuration = 0 * time.Second
 )
 
-func createTestMonitor() (*types.UpdateMonitor, *mocks.Logger) {
+func createTestMonitor() (*types.HealthMonitor, *mocks.Logger) {
 	logger := &mocks.Logger{}
-	return types.NewUpdateFrequencyMonitor(zeroDuration, logger), logger
+	return types.NewHealthMonitor(zeroDuration, logger), logger
 }
 
 // The following tests may still intermittently fail on an overloaded system as they rely
@@ -54,7 +54,7 @@ func TestRegisterDaemonServiceWithCallback_Success(t *testing.T) {
 	callbackCalled := atomic.Bool{}
 
 	ufm, _ := createTestMonitor()
-	err := ufm.RegisterDaemonServiceWithCallback("test-service", 200*time.Millisecond, func() {
+	err := ufm.RegisterHealthCheckableWithCallback("test-service", 200*time.Millisecond, func() {
 		callbackCalled.Store(true)
 	})
 	require.NoError(t, err)
@@ -100,13 +100,13 @@ func TestRegisterDaemonServiceWithCallback_DoubleRegistrationFails(t *testing.T)
 
 	ufm, _ := createTestMonitor()
 	// First registration should succeed.
-	err := ufm.RegisterDaemonServiceWithCallback("test-service", 200*time.Millisecond, func() {
+	err := ufm.RegisterHealthCheckableWithCallback("test-service", 200*time.Millisecond, func() {
 		callback1Called.Store(true)
 	})
 	require.NoError(t, err)
 
 	// Register the same daemon service again. This should fail, and 50ms update frequency should be ignored.
-	err = ufm.RegisterDaemonServiceWithCallback("test-service", 50*time.Millisecond, func() {
+	err = ufm.RegisterHealthCheckableWithCallback("test-service", 50*time.Millisecond, func() {
 		callback2Called.Store(true)
 	})
 	require.ErrorContains(t, err, "service already registered")
@@ -146,7 +146,7 @@ func TestRegisterDaemonServiceWithCallback_RegistrationFailsAfterStop(t *testing
 	callbackCalled := atomic.Bool{}
 
 	// Registering a daemon service with a callback should fail after the monitor has been stopped.
-	err := ufm.RegisterDaemonServiceWithCallback("test-service", 50*time.Millisecond, func() {
+	err := ufm.RegisterHealthCheckableWithCallback("test-service", 50*time.Millisecond, func() {
 		callbackCalled.Store(true)
 	})
 	require.ErrorContains(t, err, "monitor has been stopped")
@@ -169,7 +169,7 @@ func TestRegisterValidResponse_NegativeUpdateDelay(t *testing.T) {
 
 func TestRegisterValidResponseWithCallback_NegativeUpdateDelay(t *testing.T) {
 	ufm, _ := createTestMonitor()
-	err := ufm.RegisterDaemonServiceWithCallback("test-service", -50*time.Millisecond, func() {})
+	err := ufm.RegisterHealthCheckableWithCallback("test-service", -50*time.Millisecond, func() {})
 	require.ErrorContains(t, err, "update delay -50ms must be positive")
 }
 

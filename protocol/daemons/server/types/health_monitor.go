@@ -3,6 +3,7 @@ package types
 import (
 	"fmt"
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/dydxprotocol/v4-chain/protocol/daemons/types"
 	"sync"
 	"time"
 )
@@ -12,11 +13,10 @@ type updateMetadata struct {
 	updateFrequency time.Duration
 }
 
-// UpdateMonitor monitors the update frequency of daemon services. If a daemon service does not respond within
-// the maximum acceptable update delay set when the daemon is registered, the monitor will log an error and halt the
-// protocol. This was judged to be the best solution for network performance because it prevents any validator from
-// participating in the network at all if a daemon service is not responding.
-type UpdateMonitor struct {
+// HealthMonitor monitors the health of daemon services, which implement the HealthCheckable interface. If a
+// registered health-checkable service sustains an unhealthy state for the maximum acceptable unhealthy duration,
+// the monitor will execute a callback function.
+type HealthMonitor struct {
 	// serviceToUpdateMetadata maps daemon service names to their update metadata.
 	serviceToUpdateMetadata map[string]updateMetadata
 	// stopped indicates whether the monitor has been stopped. Additional daemon services cannot be registered
@@ -28,44 +28,46 @@ type UpdateMonitor struct {
 	// lock is used to synchronize access to the monitor.
 	lock sync.Mutex
 
-	// These fields are initialized in NewUpdateFrequencyMonitor and are not modified after initialization.
+	// These fields are initialized in NewHealthMonitor and are not modified after initialization.
 	logger                   log.Logger
 	daemonStartupGracePeriod time.Duration
 }
 
-// NewUpdateFrequencyMonitor creates a new update frequency monitor.
-func NewUpdateFrequencyMonitor(daemonStartupGracePeriod time.Duration, logger log.Logger) *UpdateMonitor {
-	return &UpdateMonitor{
+// NewHealthMonitor creates a new health monitor.
+func NewHealthMonitor(daemonStartupGracePeriod time.Duration, logger log.Logger) *HealthMonitor {
+	return &HealthMonitor{
 		serviceToUpdateMetadata:  make(map[string]updateMetadata),
 		logger:                   logger,
 		daemonStartupGracePeriod: daemonStartupGracePeriod,
 	}
 }
 
-func (ufm *UpdateMonitor) DisableForTesting() {
+func (ufm *HealthMonitor) DisableForTesting() {
 	ufm.lock.Lock()
 	defer ufm.lock.Unlock()
 
 	ufm.disabled = true
 }
 
-// RegisterDaemonServiceWithCallback registers a new daemon service with the update frequency monitor. If the daemon
-// service fails to respond within the maximum acceptable update delay, the monitor will execute the callback function.
-// This method is synchronized. The method returns an error if the daemon service was already registered or the
+// RegisterHealthCheckableWithCallback registers a HealthCheckable with the health monitor. If the service
+// stays unhealthy every time it is polled during the maximum acceptable unhealthy duration, the monitor will
+// execute the callback function.
+// This method is synchronized. The method returns an error if the service was already registered or the
 // monitor has already been stopped.
-func (ufm *UpdateMonitor) RegisterDaemonServiceWithCallback(
-	service string,
-	maximumAcceptableUpdateDelay time.Duration,
+func (ufm *HealthMonitor) RegisterHealthCheckableWithCallback(
+	hc types.HealthCheckable,
+	maximumAcceptableUnhealthyDuration time.Duration,
 	callback func(),
 ) error {
 	ufm.lock.Lock()
 	defer ufm.lock.Unlock()
 
-	if maximumAcceptableUpdateDelay <= 0 {
+	if maximumAcceptableUnhealthyDuration <= 0 {
 		return fmt.Errorf(
-			"registration failure for service %v: maximum acceptable update delay %v must be positive",
-			service,
-			maximumAcceptableUpdateDelay,
+			"health check registration failure for service %v: "+
+				"maximum acceptable unhealthy duration %v must be positive",
+			hc.ServiceName(),
+			maximumAcceptableUnhealthyDuration,
 		)
 	}
 
@@ -78,16 +80,19 @@ func (ufm *UpdateMonitor) RegisterDaemonServiceWithCallback(
 	// This could be a concern for short-running integration test cases, where the network
 	// stops before all daemon services have been registered.
 	if ufm.stopped {
-		return fmt.Errorf("registration failure for service %v: monitor has been stopped", service)
+		return fmt.Errorf(
+			"health check registration failure for service %v: monitor has been stopped",
+			hc.ServiceName(),
+		)
 	}
 
-	if _, ok := ufm.serviceToUpdateMetadata[service]; ok {
-		return fmt.Errorf("service %v already registered", service)
+	if _, ok := ufm.serviceToUpdateMetadata[hc.ServiceName()]; ok {
+		return fmt.Errorf("service %v already registered", hc.ServiceName())
 	}
 
-	ufm.serviceToUpdateMetadata[service] = updateMetadata{
-		timer:           time.AfterFunc(ufm.daemonStartupGracePeriod+maximumAcceptableUpdateDelay, callback),
-		updateFrequency: maximumAcceptableUpdateDelay,
+	ufm.serviceToUpdateMetadata[hc.ServiceName()] = updateMetadata{
+		timer:           time.AfterFunc(ufm.daemonStartupGracePeriod+maximumAcceptableUnhealthyDuration, callback),
+		updateFrequency: maximumAcceptableUnhealthyDuration,
 	}
 	return nil
 }
@@ -114,21 +119,21 @@ func LogErrorServiceNotResponding(service string, logger log.Logger) func() {
 
 // RegisterDaemonService registers a new daemon service with the update frequency monitor. If the daemon service
 // fails to respond within the maximum acceptable update delay, the monitor will log an error.
-// This method is synchronized. The method an error if the daemon service was already registered or the monitor has
+// This method is synchronized. The method an error if the service was already registered or the monitor has
 // already been stopped.
-func (ufm *UpdateMonitor) RegisterDaemonService(
-	service string,
+func (ufm *HealthMonitor) RegisterDaemonService(
+	hc types.HealthCheckable,
 	maximumAcceptableUpdateDelay time.Duration,
 ) error {
-	return ufm.RegisterDaemonServiceWithCallback(
-		service,
+	return ufm.RegisterHealthCheckableWithCallback(
+		hc,
 		maximumAcceptableUpdateDelay,
-		LogErrorServiceNotResponding(service, ufm.logger),
+		LogErrorServiceNotResponding(hc.ServiceName(), ufm.logger),
 	)
 }
 
 // Stop stops the update frequency monitor. This method is synchronized.
-func (ufm *UpdateMonitor) Stop() {
+func (ufm *HealthMonitor) Stop() {
 	ufm.lock.Lock()
 	defer ufm.lock.Unlock()
 
@@ -145,7 +150,7 @@ func (ufm *UpdateMonitor) Stop() {
 
 // RegisterValidResponse registers a valid response from the daemon service. This will reset the timer for the
 // daemon service. This method is synchronized.
-func (ufm *UpdateMonitor) RegisterValidResponse(service string) error {
+func (ufm *HealthMonitor) RegisterValidResponse(service string) error {
 	ufm.lock.Lock()
 	defer ufm.lock.Unlock()
 

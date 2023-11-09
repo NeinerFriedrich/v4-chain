@@ -26,7 +26,7 @@ type Server struct {
 	fileHandler   daemontypes.FileHandler
 	socketAddress string
 
-	updateMonitor *types.UpdateMonitor
+	updateMonitor *types.HealthMonitor
 
 	BridgeServer
 	PriceFeedServer
@@ -47,7 +47,7 @@ func NewServer(
 		gsrv:          grpcServer,
 		fileHandler:   fileHandler,
 		socketAddress: socketAddress,
-		updateMonitor: types.NewUpdateFrequencyMonitor(types.DaemonStartupGracePeriod, logger),
+		updateMonitor: types.NewHealthMonitor(types.DaemonStartupGracePeriod, logger),
 	}
 }
 
