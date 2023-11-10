@@ -1,24 +1,136 @@
 package types
 
 import (
+	cosmoslog "cosmossdk.io/log"
 	"fmt"
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/dydxprotocol/v4-chain/protocol/daemons/types"
+	libtime "github.com/dydxprotocol/v4-chain/protocol/lib/time"
 	"sync"
 	"time"
 )
 
-type updateMetadata struct {
-	timer           *time.Timer
-	updateFrequency time.Duration
+const (
+	HealthCheckPollFrequency = 5 * time.Second
+)
+
+// timestampWithError couples a timestamp and error to make it easier to update them in tandem.
+type timestampWithError struct {
+	timestamp time.Time
+	err       error
+}
+
+func (u *timestampWithError) Update(timestamp time.Time, err error) {
+	u.timestamp = timestamp
+	u.err = err
+}
+
+func (u *timestampWithError) Reset() {
+	u.Update(time.Time{}, nil)
+}
+
+func (u *timestampWithError) IsZero() bool {
+	return u.timestamp.IsZero()
+}
+
+func (u *timestampWithError) Timestamp() time.Time {
+	return u.timestamp
+}
+
+func (u *timestampWithError) Error() error {
+	return u.err
+}
+
+// healthChecker encapsulates the logic for monitoring the health of a health checkable service.
+type healthChecker struct {
+	// healthCheckable is the health checkable service to be monitored.
+	healthCheckable types.HealthCheckable
+
+	// timer triggers a health check poll for a health checkable service.
+	timer *time.Timer
+
+	// pollFrequency is the frequency at which the health checkable service is polled.
+	pollFrequency time.Duration
+
+	// mostRecentSuccess is the timestamp of the most recent successful health check.
+	mostRecentSuccess time.Time
+
+	// firstFailureInStreak is the timestamp of the first error in the most recent streak of errors. It is set
+	// whenever the service toggles from healthy to an unhealthy state, and used to determine how long the daemon has
+	// been unhealthy. If this timestamp is nil, then the error streak ended before it could trigger a callback.
+	firstFailureInStreak timestampWithError
+
+	// unhealthyCallback is the callback function to be executed if the health checkable service remains
+	// unhealthy for a period of time greater than or equal to the maximum acceptable unhealthy duration.
+	// This callback function is executed with the error that caused the service to become unhealthy.
+	unhealthyCallback func(error)
+
+	// timeProvider is used to get the current time. It is added as a field so that it can be mocked in tests.
+	timeProvider libtime.TimeProvider
+
+	// maximumAcceptableUnhealthyDuration is the maximum acceptable duration for a health checkable service to
+	// remain unhealthy. If the service remains unhealthy for this duration, the monitor will execute the
+	// specified callback function.
+	maximumAcceptableUnhealthyDuration time.Duration
+}
+
+// poll executes a health check for the health checkable service. If the service has been unhealthy for longer than the
+// maximum acceptable unhealthy duration, the callback function is executed.
+func (hc *healthChecker) poll() {
+	// Don't return an error if the monitor has been disabled.
+	err := hc.healthCheckable.HealthCheck()
+	if err == nil {
+		hc.mostRecentSuccess = hc.timeProvider.Now()
+		// Whenever the service is healthy, reset the first failure in streak timestamp.
+		hc.firstFailureInStreak.Reset()
+	} else if hc.firstFailureInStreak.IsZero() {
+		// Capture the timestamp of the first failure in a new streak.
+		hc.firstFailureInStreak.Update(hc.timeProvider.Now(), err)
+	}
+
+	// If the service has been unhealthy for longer than the maximum acceptable unhealthy duration, execute the
+	// callback function.
+	if !hc.firstFailureInStreak.IsZero() &&
+		hc.timeProvider.Now().Sub(hc.firstFailureInStreak.Timestamp()) >= hc.maximumAcceptableUnhealthyDuration {
+		hc.unhealthyCallback(hc.firstFailureInStreak.Error())
+	} else {
+		// If we do not execute the callback, schedule the next poll.
+		hc.timer.Reset(hc.pollFrequency)
+	}
+}
+
+func (hc *healthChecker) Stop() {
+	hc.timer.Stop()
+}
+
+// StartNewHealthChecker creates and starts a new health checker for a health checkable service.
+func StartNewHealthChecker(
+	healthCheckable types.HealthCheckable,
+	pollFrequency time.Duration,
+	unhealthyCallback func(error),
+	timeProvider libtime.TimeProvider,
+	maximumAcceptableUnhealthyDuration time.Duration,
+	startupGracePeriod time.Duration,
+) *healthChecker {
+	checker := &healthChecker{
+		healthCheckable:                    healthCheckable,
+		pollFrequency:                      pollFrequency,
+		unhealthyCallback:                  unhealthyCallback,
+		timeProvider:                       timeProvider,
+		maximumAcceptableUnhealthyDuration: maximumAcceptableUnhealthyDuration,
+	}
+	// The first poll is scheduled after the startup grace period to allow the service to initialize.
+	checker.timer = time.AfterFunc(startupGracePeriod, checker.poll)
+
+	return checker
 }
 
 // HealthMonitor monitors the health of daemon services, which implement the HealthCheckable interface. If a
 // registered health-checkable service sustains an unhealthy state for the maximum acceptable unhealthy duration,
 // the monitor will execute a callback function.
 type HealthMonitor struct {
-	// serviceToUpdateMetadata maps daemon service names to their update metadata.
-	serviceToUpdateMetadata map[string]updateMetadata
+	// serviceToHealthChecker maps daemon service names to their update metadata.
+	serviceToHealthChecker map[string]*healthChecker
 	// stopped indicates whether the monitor has been stopped. Additional daemon services cannot be registered
 	// after the monitor has been stopped.
 	stopped bool
@@ -29,24 +141,30 @@ type HealthMonitor struct {
 	lock sync.Mutex
 
 	// These fields are initialized in NewHealthMonitor and are not modified after initialization.
-	logger                   log.Logger
-	daemonStartupGracePeriod time.Duration
+	logger             log.Logger
+	startupGracePeriod time.Duration
+	pollingFrequency   time.Duration
 }
 
 // NewHealthMonitor creates a new health monitor.
-func NewHealthMonitor(daemonStartupGracePeriod time.Duration, logger log.Logger) *HealthMonitor {
+func NewHealthMonitor(
+	startupGracePeriod time.Duration,
+	pollingFrequency time.Duration,
+	logger log.Logger,
+) *HealthMonitor {
 	return &HealthMonitor{
-		serviceToUpdateMetadata:  make(map[string]updateMetadata),
-		logger:                   logger,
-		daemonStartupGracePeriod: daemonStartupGracePeriod,
+		serviceToHealthChecker: make(map[string]*healthChecker),
+		logger:                 logger.With(cosmoslog.ModuleKey, "health-monitor"),
+		startupGracePeriod:     startupGracePeriod,
+		pollingFrequency:       pollingFrequency,
 	}
 }
 
-func (ufm *HealthMonitor) DisableForTesting() {
-	ufm.lock.Lock()
-	defer ufm.lock.Unlock()
+func (hm *HealthMonitor) DisableForTesting() {
+	hm.lock.Lock()
+	defer hm.lock.Unlock()
 
-	ufm.disabled = true
+	hm.disabled = true
 }
 
 // RegisterHealthCheckableWithCallback registers a HealthCheckable with the health monitor. If the service
@@ -54,13 +172,13 @@ func (ufm *HealthMonitor) DisableForTesting() {
 // execute the callback function.
 // This method is synchronized. The method returns an error if the service was already registered or the
 // monitor has already been stopped.
-func (ufm *HealthMonitor) RegisterHealthCheckableWithCallback(
+func (hm *HealthMonitor) RegisterHealthCheckableWithCallback(
 	hc types.HealthCheckable,
 	maximumAcceptableUnhealthyDuration time.Duration,
-	callback func(),
+	callback func(error),
 ) error {
-	ufm.lock.Lock()
-	defer ufm.lock.Unlock()
+	hm.lock.Lock()
+	defer hm.lock.Unlock()
 
 	if maximumAcceptableUnhealthyDuration <= 0 {
 		return fmt.Errorf(
@@ -72,103 +190,86 @@ func (ufm *HealthMonitor) RegisterHealthCheckableWithCallback(
 	}
 
 	// Don't register daemon services if the monitor has been disabled.
-	if ufm.disabled {
+	if hm.disabled {
 		return nil
 	}
 
 	// Don't register additional daemon services if the monitor has already been stopped.
 	// This could be a concern for short-running integration test cases, where the network
 	// stops before all daemon services have been registered.
-	if ufm.stopped {
+	if hm.stopped {
 		return fmt.Errorf(
 			"health check registration failure for service %v: monitor has been stopped",
 			hc.ServiceName(),
 		)
 	}
 
-	if _, ok := ufm.serviceToUpdateMetadata[hc.ServiceName()]; ok {
+	if _, ok := hm.serviceToHealthChecker[hc.ServiceName()]; ok {
 		return fmt.Errorf("service %v already registered", hc.ServiceName())
 	}
 
-	ufm.serviceToUpdateMetadata[hc.ServiceName()] = updateMetadata{
-		timer:           time.AfterFunc(ufm.daemonStartupGracePeriod+maximumAcceptableUnhealthyDuration, callback),
-		updateFrequency: maximumAcceptableUnhealthyDuration,
-	}
+	hm.serviceToHealthChecker[hc.ServiceName()] = StartNewHealthChecker(
+		hc,
+		hm.pollingFrequency,
+		callback,
+		&libtime.TimeProviderImpl{},
+		maximumAcceptableUnhealthyDuration,
+		hm.startupGracePeriod,
+	)
 	return nil
 }
 
 // PanicServiceNotResponding returns a function that panics with a message indicating that the specified daemon
 // service is not responding. This is ideal for creating a callback function when registering a daemon service.
-func PanicServiceNotResponding(service string) func() {
-	return func() {
-		panic(fmt.Sprintf("%v daemon not responding", service))
+func PanicServiceNotResponding(hc types.HealthCheckable) func(error) {
+	return func(err error) {
+		panic(fmt.Sprintf("%v unhealthy: %v", hc.ServiceName(), err))
 	}
 }
 
-// LogErrorServiceNotResponding returns a function that logs an error indicating that the specified daemon service
-// is not responding. This is ideal for creating a callback function when registering a daemon service.
-func LogErrorServiceNotResponding(service string, logger log.Logger) func() {
-	return func() {
+// LogErrorServiceNotResponding returns a function that logs an error indicating that the specified service
+// is not responding. This is ideal for creating a callback function when registering a health checkable service.
+func LogErrorServiceNotResponding(hc types.HealthCheckable, logger log.Logger) func(error) {
+	return func(err error) {
 		logger.Error(
-			"daemon not responding",
+			"health-checked service is unhealthy",
 			"service",
-			service,
+			hc.ServiceName(),
+			"error",
+			err,
 		)
 	}
 }
 
-// RegisterDaemonService registers a new daemon service with the update frequency monitor. If the daemon service
-// fails to respond within the maximum acceptable update delay, the monitor will log an error.
-// This method is synchronized. The method an error if the service was already registered or the monitor has
+// RegisterService registers a new health checkable service with the health check monitor. If the service
+// is unhealthy every time it is polled for a duration greater than or equal to the maximum acceptable unhealthy
+// duration, the monitor will panic.
+// This method is synchronized. It returns an error if the service was already registered or the monitor has
 // already been stopped.
-func (ufm *HealthMonitor) RegisterDaemonService(
+func (hm *HealthMonitor) RegisterService(
 	hc types.HealthCheckable,
-	maximumAcceptableUpdateDelay time.Duration,
+	maximumAcceptableUnhealthyDuration time.Duration,
 ) error {
-	return ufm.RegisterHealthCheckableWithCallback(
+	return hm.RegisterHealthCheckableWithCallback(
 		hc,
-		maximumAcceptableUpdateDelay,
-		LogErrorServiceNotResponding(hc.ServiceName(), ufm.logger),
+		maximumAcceptableUnhealthyDuration,
+		LogErrorServiceNotResponding(hc, hm.logger),
 	)
 }
 
 // Stop stops the update frequency monitor. This method is synchronized.
-func (ufm *HealthMonitor) Stop() {
-	ufm.lock.Lock()
-	defer ufm.lock.Unlock()
+func (hm *HealthMonitor) Stop() {
+	hm.lock.Lock()
+	defer hm.lock.Unlock()
 
 	// Don't stop the monitor if it has already been stopped.
-	if ufm.stopped {
+	if hm.stopped {
 		return
 	}
 
-	for _, metadata := range ufm.serviceToUpdateMetadata {
-		metadata.timer.Stop()
-	}
-	ufm.stopped = true
-}
-
-// RegisterValidResponse registers a valid response from the daemon service. This will reset the timer for the
-// daemon service. This method is synchronized.
-func (ufm *HealthMonitor) RegisterValidResponse(service string) error {
-	ufm.lock.Lock()
-	defer ufm.lock.Unlock()
-
-	// Don't return an error if the monitor has been disabled.
-	if ufm.disabled {
-		return nil
+	for _, checker := range hm.serviceToHealthChecker {
+		checker.Stop()
 	}
 
-	// Don't bother to reset the timer if the monitor has already been stopped.
-	if ufm.stopped {
-		return nil
-	}
-
-	metadata, ok := ufm.serviceToUpdateMetadata[service]
-	if !ok {
-		return fmt.Errorf("service %v not registered", service)
-	}
-
-	metadata.timer.Reset(metadata.updateFrequency)
-	return nil
+	hm.stopped = true
 }
